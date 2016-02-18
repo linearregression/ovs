@@ -1329,7 +1329,8 @@ has_stateful_acl(struct ovn_datapath *od)
 }
 
 static void
-build_acls(struct ovn_datapath *od, struct hmap *lflows, struct hmap *ports)
+build_pre_acls(struct ovn_datapath *od, struct hmap *lflows,
+               struct hmap *ports)
 {
     bool has_stateful = has_stateful_acl(od);
     struct ovn_port *op;
@@ -1338,12 +1339,6 @@ build_acls(struct ovn_datapath *od, struct hmap *lflows, struct hmap *ports)
      * allowed by default. */
     ovn_lflow_add(lflows, od, S_SWITCH_IN_PRE_ACL, 0, "1", "next;");
     ovn_lflow_add(lflows, od, S_SWITCH_OUT_PRE_ACL, 0, "1", "next;");
-
-    /* Ingress and Egress ACL Table (Priority 0): Packets are allowed by
-     * default.  A related rule at priority 1 is added below if there
-     * are any stateful ACLs in this datapath. */
-    ovn_lflow_add(lflows, od, S_SWITCH_IN_ACL, 0, "1", "next;");
-    ovn_lflow_add(lflows, od, S_SWITCH_OUT_ACL, 0, "1", "next;");
 
     /* If there are any stateful ACL rules in this dapapath, we must
      * send all IP packets through the conntrack action, which handles
@@ -1385,7 +1380,21 @@ build_acls(struct ovn_datapath *od, struct hmap *lflows, struct hmap *ports)
          * the return traffic needs to be followed. */
         ovn_lflow_add(lflows, od, S_SWITCH_IN_PRE_ACL, 100, "ip", "ct_next;");
         ovn_lflow_add(lflows, od, S_SWITCH_OUT_PRE_ACL, 100, "ip", "ct_next;");
+    }
+}
 
+static void
+build_acls(struct ovn_datapath *od, struct hmap *lflows)
+{
+    bool has_stateful = has_stateful_acl(od);
+
+    /* Ingress and Egress ACL Table (Priority 0): Packets are allowed by
+     * default.  A related rule at priority 1 is added below if there
+     * are any stateful ACLs in this datapath. */
+    ovn_lflow_add(lflows, od, S_SWITCH_IN_ACL, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_SWITCH_OUT_ACL, 0, "1", "next;");
+
+    if (has_stateful) {
         /* Ingress and Egress ACL Table (Priority 1).
          *
          * By default, traffic is allowed.  This is partially handled by
@@ -1495,7 +1504,8 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
             continue;
         }
 
-        build_acls(od, lflows, ports);
+        build_pre_acls(od, lflows, ports);
+        build_acls(od, lflows);
     }
 
     /* Logical switch ingress table 0: Admission control framework (priority
