@@ -94,15 +94,17 @@ enum ovn_stage {
     PIPELINE_STAGE(SWITCH, IN,  PRE_ACL,        3, "ls_in_pre_acl")      \
     PIPELINE_STAGE(SWITCH, IN,  PRE_STATEFUL,   4, "ls_in_pre_stateful")    \
     PIPELINE_STAGE(SWITCH, IN,  ACL,            5, "ls_in_acl")          \
-    PIPELINE_STAGE(SWITCH, IN,  ARP_RSP,        6, "ls_in_arp_rsp")      \
-    PIPELINE_STAGE(SWITCH, IN,  L2_LKUP,        7, "ls_in_l2_lkup")      \
+    PIPELINE_STAGE(SWITCH, IN,  STATEFUL,       6, "ls_in_stateful")     \
+    PIPELINE_STAGE(SWITCH, IN,  ARP_RSP,        7, "ls_in_arp_rsp")      \
+    PIPELINE_STAGE(SWITCH, IN,  L2_LKUP,        8, "ls_in_l2_lkup")      \
                                                                       \
     /* Logical switch egress stages. */                               \
     PIPELINE_STAGE(SWITCH, OUT, PRE_ACL,      0, "ls_out_pre_acl")     \
     PIPELINE_STAGE(SWITCH, OUT, PRE_STATEFUL, 1, "ls_out_pre_stateful")  \
-    PIPELINE_STAGE(SWITCH, OUT, ACL,          2, "ls_out_acl")         \
-    PIPELINE_STAGE(SWITCH, OUT, PORT_SEC_IP,  3, "ls_out_port_sec_ip")    \
-    PIPELINE_STAGE(SWITCH, OUT, PORT_SEC_L2,  4, "ls_out_port_sec_l2")    \
+    PIPELINE_STAGE(SWITCH, OUT, ACL,          2, "ls_out_acl")            \
+    PIPELINE_STAGE(SWITCH, OUT, STATEFUL,     3, "ls_out_stateful")       \
+    PIPELINE_STAGE(SWITCH, OUT, PORT_SEC_IP,  4, "ls_out_port_sec_ip")    \
+    PIPELINE_STAGE(SWITCH, OUT, PORT_SEC_L2,  5, "ls_out_port_sec_l2")    \
                                                                       \
     /* Logical router ingress stages. */                              \
     PIPELINE_STAGE(ROUTER, IN,  ADMISSION,   0, "lr_in_admission")    \
@@ -1427,9 +1429,9 @@ build_acls(struct ovn_datapath *od, struct hmap *lflows)
          * and then its return traffic would not have an associated
          * conntrack entry and would return "+invalid". */
         ovn_lflow_add(lflows, od, S_SWITCH_IN_ACL, 1, "ip",
-                      "ct_commit; next;");
+                      "reg0[1] = 1; next;");
         ovn_lflow_add(lflows, od, S_SWITCH_OUT_ACL, 1, "ip",
-                      "ct_commit; next;");
+                      "reg0[1] = 1; next;");
 
         /* Ingress and Egress ACL Table (Priority 65535).
          *
@@ -1482,7 +1484,8 @@ build_acls(struct ovn_datapath *od, struct hmap *lflows)
              * direction may not have any stateful rules, the server's
              * may and then its return traffic would not have an
              * associated conntrack entry and would return "+invalid". */
-            const char *actions = has_stateful ? "ct_commit; next;" : "next;";
+            const char *actions = has_stateful
+                                    ? "reg0[1] = 1; next;" : "next;";
             ovn_lflow_add(lflows, od, stage,
                           acl->priority + OVN_ACL_PRI_OFFSET,
                           acl->match, actions);
@@ -1495,7 +1498,7 @@ build_acls(struct ovn_datapath *od, struct hmap *lflows)
             ds_put_format(&match, "ct.new && (%s)", acl->match);
             ovn_lflow_add(lflows, od, stage,
                           acl->priority + OVN_ACL_PRI_OFFSET,
-                          ds_cstr(&match), "ct_commit; next;");
+                          ds_cstr(&match), "reg0[1] = 1; next;");
 
             ds_destroy(&match);
         } else if (!strcmp(acl->action, "drop")) {
@@ -1510,6 +1513,22 @@ build_acls(struct ovn_datapath *od, struct hmap *lflows)
                           acl->match, "drop;");
         }
     }
+}
+
+static void
+build_stateful(struct ovn_datapath *od, struct hmap *lflows)
+{
+    /* Ingress and Egress stateful Table (Priority 0): Packets are
+     * allowed by default. */
+    ovn_lflow_add(lflows, od, S_SWITCH_IN_STATEFUL, 0, "1", "next;");
+    ovn_lflow_add(lflows, od, S_SWITCH_OUT_STATEFUL, 0, "1", "next;");
+
+    /* If reg0[1] is set as 1, then the packets should be committed to
+     * conntrack. */
+    ovn_lflow_add(lflows, od, S_SWITCH_IN_STATEFUL, 100, "reg0[1] == 1",
+                  "ct_commit; next;");
+    ovn_lflow_add(lflows, od, S_SWITCH_OUT_STATEFUL, 100, "reg0[1] == 1",
+                  "ct_commit; next;");
 }
 
 static void
@@ -1530,6 +1549,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
         build_pre_acls(od, lflows, ports);
         build_pre_stateful(od, lflows);
         build_acls(od, lflows);
+        build_stateful(od, lflows);
     }
 
     /* Logical switch ingress table 0: Admission control framework (priority
