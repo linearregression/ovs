@@ -18,9 +18,12 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include "actions.h"
+#include "bitmap.h"
 #include "byte-order.h"
 #include "compiler.h"
 #include "expr.h"
+#include "hash.h"
+#include "hmap.h"
 #include "lex.h"
 #include "logical-fields.h"
 #include "openvswitch/dynamic-string.h"
@@ -414,6 +417,131 @@ parse_put_arp_action(struct action_context *ctx)
 }
 
 static void
+parse_ct_lb_action(struct action_context *ctx)
+{
+    uint8_t recirc_table;
+    if (ctx->ap->cur_ltable < ctx->ap->n_tables) {
+        recirc_table = ctx->ap->first_ptable + ctx->ap->cur_ltable + 1;
+    } else {
+        action_error(ctx, "\"ct_lb\" action not allowed in last table.");
+        return;
+    }
+
+    if (!lexer_match(ctx->lexer, LEX_T_LPAREN)) {
+        /* ct_lb without parenthesis means that this is an established
+         * connection and we just need to do a NAT. */
+        struct ofpact_conntrack *ct = ofpact_put_CT(ctx->ofpacts);
+        struct ofpact_nat *nat;
+        size_t nat_offset;
+        ct->zone_src.field = mf_from_id(MFF_LOG_CT_ZONE);
+        ct->zone_src.ofs = 0;
+        ct->zone_src.n_bits = 16;
+        ct->flags = 0;
+        ct->recirc_table = recirc_table;
+        ct->alg = 0;
+
+        add_prerequisite(ctx, "ip");
+
+        nat_offset = ctx->ofpacts->size;
+        ofpbuf_pull(ctx->ofpacts, nat_offset);
+
+        nat = ofpact_put_NAT(ctx->ofpacts);
+        nat->flags = 0;
+        nat->range_af = AF_UNSPEC;
+
+        ctx->ofpacts->header = ofpbuf_push_uninit(ctx->ofpacts, nat_offset);
+        ct = ctx->ofpacts->header;
+        ofpact_finish(ctx->ofpacts, &ct->ofpact);
+        return;
+    }
+
+    char *ips, *ip, *save = NULL;
+    uint32_t group_id = 0, bucket_id = 0, hash;
+    struct group_info *group_info;
+    struct ofpact_group *og;
+    struct ds *ds;
+
+    if (!lexer_get_string(ctx->lexer, &ips)) {
+        action_error(ctx, "ct_lb has missing ip parameters.");
+        return;
+    }
+
+    ds = xmalloc(sizeof *ds);
+    ds_init(ds);
+    ds_put_format(ds, "type=select");
+
+    ip = strtok_r(ips, ",", &save);
+    ds_put_format(ds, ",bucket=bucket_id=%u,weight:100,actions="
+                  "ct(nat(dst=%s),commit,table=%d,zone=NXM_NX_REG5[0..15])"
+                  ,bucket_id, ip, recirc_table);
+    while ((ip = strtok_r(NULL, ",", &save)) != NULL) {
+        bucket_id++;
+        ds_put_format(ds, ",bucket=bucket_id=%u,weight:100,actions="
+                      "ct(nat(dst=%s),commit,table=%d,zone="
+                      "NXM_NX_REG5[0..15])", bucket_id, ip, recirc_table);
+    }
+
+    free(ips);
+    if (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
+        ds_destroy(ds);
+        free(ds);
+        action_syntax_error(ctx, "expecting `)'");
+        return;
+    }
+
+    hash = hash_string(ds_cstr(ds), 0);
+
+    /* Check whether we have non installed but allocated group_id. */
+    HMAP_FOR_EACH_WITH_HASH (group_info, hmap_node, hash,
+                             &ctx->ap->group_table->desired_groups) {
+        if (!strcmp(ds_cstr(group_info->group), ds_cstr(ds))) {
+            group_id = group_info->group_id;
+            break;
+        }
+    }
+
+    if (!group_id) {
+        /* Check whether we already have an installed entry for this
+         * combination. */
+        HMAP_FOR_EACH_WITH_HASH (group_info, hmap_node, hash,
+                                 &ctx->ap->group_table->existing_groups) {
+            if (!strcmp(ds_cstr(group_info->group), ds_cstr(ds))) {
+                group_id = group_info->group_id;
+            }
+        }
+
+        if (!group_id) {
+            /* Reserve a new group_id. */
+            group_id = bitmap_scan(ctx->ap->group_table->group_ids, 0, 1,
+                                   MAX_OVN_GROUPS + 1);
+        }
+
+        if (group_id == MAX_OVN_GROUPS + 1) {
+            ds_destroy(ds);
+            free(ds);
+            action_error(ctx, "out of group ids.");
+            return;
+        }
+        bitmap_set1(ctx->ap->group_table->group_ids, group_id);
+
+        group_info = xmalloc(sizeof *group_info);
+        group_info->group = ds;
+        group_info->group_id = group_id;
+        group_info->hmap_node.hash = hash;
+
+        hmap_insert(&ctx->ap->group_table->desired_groups,
+                    &group_info->hmap_node, group_info->hmap_node.hash);
+    } else {
+        ds_destroy(ds);
+        free(ds);
+    }
+
+    /* Create an action to set the group. */
+    og = ofpact_put_GROUP(ctx->ofpacts);
+    og->group_id = group_id;
+}
+
+static void
 emit_ct(struct action_context *ctx, bool recirc_next, bool commit)
 {
     struct ofpact_conntrack *ct = ofpact_put_CT(ctx->ofpacts);
@@ -548,6 +676,8 @@ parse_action(struct action_context *ctx)
         emit_ct(ctx, true, false);
     } else if (lexer_match_id(ctx->lexer, "ct_commit")) {
         emit_ct(ctx, false, true);
+    } else if (lexer_match_id(ctx->lexer, "ct_lb")) {
+        parse_ct_lb_action(ctx);
     } else if (lexer_match_id(ctx->lexer, "ct_dnat")) {
         parse_ct_nat(ctx, false);
     } else if (lexer_match_id(ctx->lexer, "ct_snat")) {

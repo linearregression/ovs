@@ -828,3 +828,17 @@ lexer_get_int(struct lexer *lexer, int *value)
         return false;
     }
 }
+
+
+bool
+lexer_get_string(struct lexer *lexer, char **str)
+{
+    if (lexer->token.type == LEX_T_STRING) {
+        *str = xstrdup(lexer->token.s);
+        lexer_get(lexer);
+        return true;
+    } else {
+        *str = NULL;
+        return false;
+    }
+}

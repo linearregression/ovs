@@ -121,5 +121,6 @@ bool lexer_match(struct lexer *, enum lex_type);
 bool lexer_match_id(struct lexer *, const char *id);
 bool lexer_is_int(const struct lexer *);
 bool lexer_get_int(struct lexer *, int *value);
+bool lexer_get_string(struct lexer *, char  **str);
 
 #endif /* ovn/lex.h */
