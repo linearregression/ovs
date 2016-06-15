@@ -2278,6 +2278,16 @@ build_lrouter_flows(struct hmap *datapaths, struct hmap *ports,
         ovn_lflow_add(lflows, op->od, S_ROUTER_IN_IP_INPUT, 60,
                       match, "drop;");
         free(match);
+
+        /* When destination IP address is in the same subnet as the
+         * router port, the packet may need to be eventually sent
+         * back the same port. For cases like that, allow sending
+         * out the inport. */
+        match = xasprintf("ip4.dst == "IP_FMT"/"IP_FMT,
+                          IP_ARGS(op->network), IP_ARGS(op->mask));
+        ovn_lflow_add(lflows, op->od, S_ROUTER_IN_IP_INPUT, 20,
+                      match, "inport = \"\"; next;");
+        free(match);
     }
 
     /* NAT in Gateway routers. */
